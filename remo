@@ -1,0 +1,151 @@
+#!/bin/bash
+set -e
+
+# Wraps Remote Execution, Container and Interactive Queue
+
+# Define usage message
+usage() {
+    echo "Usage: remo [options] <command>"
+    echo "Options:"
+    echo "  --help    - Display this help message"
+    echo "  --init    - Create .remo configuration file in the current directory"
+    echo "  --edit    - Open the .remo configuration file for editing"
+    echo "  --verbose - Enable verbose output"
+    echo "Commands:"
+    echo "  <command> - Execute the command on the remote server"
+    exit 1
+}
+
+# INFO function for verbose messages
+INFO() {
+    if [ "$VERBOSE" = true ]; then
+        printf "\e[32m[INFO]\e[0m %s\n" "$1"
+    fi
+}
+
+# ERRO function for error messages
+ERRO() {
+    printf "\e[31m[ERRO]\e[0m %s\n" "$1" >&2
+}
+
+CONFIG_FILE=".remo"
+COMMAND="bash --login"
+
+# Handle options
+VERBOSE=false
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --init)
+            # Initialize .remo configuration file
+            if [ -f "$CONFIG_FILE" ]; then
+                ERRO "$CONFIG_FILE already exists."
+                exit 1
+            else
+                INFO "Creating $CONFIG_FILE..."
+                echo "REMOTE=user@remote.server.com" > "$CONFIG_FILE"
+                echo "#PREFIX=srun -p a100 --pty" >> "$CONFIG_FILE"
+                echo "#CONTAINER_MODE=apptainer" >> "$CONFIG_FILE"
+                echo "#CONTAINER_FILE=hello.def" >> "$CONFIG_FILE"
+                INFO "$CONFIG_FILE created with default remote configuration."
+            fi
+            # Open the configuration file for editing
+            vim "$CONFIG_FILE"
+            exit 0
+            ;;
+        --help)
+            usage
+            exit 0
+            ;;
+        --verbose)
+            VERBOSE=true
+            ;;
+        --edit)
+            # Find and open the .remo configuration file
+            CURRENT_DIR=$(pwd)
+            while [ ! -f "$CURRENT_DIR/$CONFIG_FILE" ]; do
+                if [ "$CURRENT_DIR" == "/" ]; then
+                    ERRO ".remo configuration file not found."
+                    exit 1
+                fi
+                CURRENT_DIR=$(dirname "$CURRENT_DIR")
+            done
+            vim "$CURRENT_DIR/$CONFIG_FILE"
+            exit 0
+            ;;
+        *)
+            COMMAND="$@"
+            break
+            ;;
+    esac
+    shift
+done
+
+# Find .remo configuration file
+CURRENT_DIR=$(pwd)
+while [ ! -f "$CURRENT_DIR/$CONFIG_FILE" ]; do
+    if [ "$CURRENT_DIR" == "/" ]; then
+        ERRO ".remo configuration file not found."
+        exit 1
+    fi
+    CURRENT_DIR=$(dirname "$CURRENT_DIR")
+done
+
+# Source the .remo configuration file
+source "$CURRENT_DIR/$CONFIG_FILE"
+
+# Check if REMOTE is set
+if [ -z "$REMOTE" ]; then
+    ERRO "REMOTE not specified in .remo configuration file."
+    exit 1
+fi
+
+# Generate unique sync directory
+LOCAL_HOSTNAME=$(hostname -s)
+SYNC_DIR="~/.remo/$(whoami)@$LOCAL_HOSTNAME"
+INFO "Syncing local files with remote host to $SYNC_DIR..."
+
+# Create remote directory
+ssh "$REMOTE" "mkdir -p $SYNC_DIR"
+
+# Synchronize files using rsync
+[ "$VERBOSE" = true ] && RSYNC_OPTS="-avz" || RSYNC_OPTS="-az"
+rsync $RSYNC_OPTS "$CURRENT_DIR"/ "$REMOTE":"$SYNC_DIR"
+
+# Check if PREFIX is set
+if [ -n "$PREFIX" ]; then
+    INFO "Using prefix: $PREFIX"
+fi
+
+# Check if CONTAINER_FILE is set
+if [ -n "$CONTAINER_FILE" ]; then
+    INFO "Using container configuration: $CONTAINER_FILE"
+    CONTAINER_PATH="$SYNC_DIR/$CONTAINER_FILE"
+    SIF_FILE="${CONTAINER_PATH%.*}.sif"
+    # Check if container needs to be built
+    LOCAL_DEF_TIMESTAMP=$(date -r "$CURRENT_DIR/$CONTAINER_FILE" +%s)
+    REMOTE_SIF_TIMESTAMP=$(ssh "$REMOTE" "if [ -f $SIF_FILE ]; then date -r $SIF_FILE +%s; else echo 0; fi")
+
+    if [ "$LOCAL_DEF_TIMESTAMP" -ne 0 ] && [ "$LOCAL_DEF_TIMESTAMP" -gt "$REMOTE_SIF_TIMESTAMP" ]; then
+        INFO "Building container $SIF_FILE from $CONTAINER_PATH..."
+        ssh -tt "$REMOTE" "$PREFIX $CONTAINER_MODE build --fakeroot --force $SIF_FILE $CONTAINER_PATH"
+    else
+        INFO "Skipping container build as the existing .sif file is up-to-date."
+    fi
+    PREFIX="$PREFIX $CONTAINER_MODE exec --nv $SIF_FILE"
+fi
+
+# Record timestamp before executing the command
+timestamp_file=$(ssh "$REMOTE" "mktemp /tmp/remo_time.XXXXXX")
+
+# Execute the command via SSH
+INFO "> $PREFIX $COMMAND"
+ssh -tt -q "$REMOTE" "cd $SYNC_DIR && $PREFIX $COMMAND"
+
+# Transfer new files from the remote server
+INFO "Transferring new files from server"
+new_files_list=$(mktemp /tmp/remo_list.XXXXXX)
+ssh "$REMOTE" "cd $SYNC_DIR && find . -type f -newer $timestamp_file ! -name '*.sif'" > $new_files_list
+rsync $RSYNC_OPTS --files-from=$new_files_list "$REMOTE":"$SYNC_DIR"/ "$CURRENT_DIR"/
+rm $new_files_list
+
+INFO "Remo completed."
